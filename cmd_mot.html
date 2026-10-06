@@ -1,0 +1,121 @@
+const char PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stepper</title>
+<style>
+body{font-family:sans-serif;max-width:420px;margin:20px auto;padding:0 12px}
+button{padding:12px;margin:4px;min-width:90px;font-size:16px}
+input{padding:8px;font-size:16px;width:110px}
+.box{border:1px solid #ccc;border-radius:8px;padding:10px;margin:10px 0}
+</style></head><body>
+<h2>ESP32-CAM Stepper</h2>
+<div class="box">Position : <b id="pos">-</b> pas (<span id="deg">-</span>°)<br>
+Cible : <span id="tgt">-</span> | Vitesse : <span id="rpm">-</span> tr/min</div>
+<div class="box">
+<button onclick="c('/deg?v=-360')">-1 tour</button>
+<button onclick="c('/deg?v=-90')">-90°</button>
+<button onclick="c('/deg?v=90')">+90°</button>
+<button onclick="c('/deg?v=360')">+1 tour</button></div>
+<div class="box">
+<input id="st" type="number" value="512"> pas
+<button onclick="c('/move?v='+st.value)">Déplacer</button><br>
+<input id="ab" type="number" value="0"> pas
+<button onclick="c('/goto?v='+ab.value)">Aller à</button></div>
+<div class="box">
+<button onclick="c('/run?v=-1')">⟲ Continu</button>
+<button onclick="c('/stop')" style="background:#e55;color:#fff">STOP</button>
+<button onclick="c('/run?v=1')">⟳ Continu</button><br>
+<button onclick="c('/zero')">Zéro ici</button></div>
+<div class="box">Vitesse : <input id="sp" type="range" min="1" max="15" value="10"
+ onchange="c('/speed?v='+this.value)" style="width:200px"></div>
+<script>
+function c(u){fetch(u).then(upd)}
+function upd(){fetch('/status').then(r=>r.json()).then(d=>{
+ pos.textContent=d.pos;tgt.textContent=d.target;rpm.textContent=d.rpm;
+ deg.textContent=(d.pos*360/4096).toFixed(1);})}
+setInterval(upd,500);upd();
+</script></body></html>
+)rawliteral";
+
+long argLong() { return server.hasArg("v") ? server.arg("v").toInt() : 0; }
+
+void setupWeb() {
+  server.on("/", []() { server.send_P(200, "text/html", PAGE); });
+  server.on("/move",  []() { continuous = false; target += argLong(); server.send(200, "text/plain", "OK"); });
+  server.on("/goto",  []() { continuous = false; target  = argLong(); server.send(200, "text/plain", "OK"); });
+  server.on("/deg",   []() {
+    continuous = false;
+    target += lround(server.arg("v").toFloat() * STEPS_PER_REV / 360.0);
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/speed", []() { setSpeed(server.arg("v").toFloat()); server.send(200, "text/plain", "OK"); });
+  server.on("/run",   []() { contDir = (argLong() >= 0) ? 1 : -1; continuous = true; server.send(200, "text/plain", "OK"); });
+  server.on("/stop",  []() { stopMotor(); server.send(200, "text/plain", "OK"); });
+  server.on("/zero",  []() { stopMotor(); position = target = 0; server.send(200, "text/plain", "OK"); });
+  server.on("/status", []() {
+    String j = "{\"pos\":" + String(position) + ",\"target\":" + String(target) +
+               ",\"rpm\":" + String(rpm, 1) + ",\"running\":" + String(continuous || position != target) + "}";
+    server.send(200, "application/json", j);
+  });
+  server.begin();
+}
+
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connexion Wi-Fi");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nConnecté : http://%s\n", WiFi.localIP().toString().c_str());
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    Serial.printf("\nÉchec -> point d'accès \"%s\" : http://%s\n",
+                  AP_SSID, WiFi.softAPIP().toString().c_str());
+  }
+}
+
+// ---------- Série ----------
+void handleSerial() {
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+  char cmd = tolower(line[0]);
+  float val = line.substring(1).toFloat();
+
+  switch (cmd) {
+    case 'm': continuous = false; target += (long)val; break;
+    case 'g': continuous = false; target  = (long)val; break;
+    case 'd': continuous = false; target += lround(val * STEPS_PER_REV / 360.0); break;
+    case 's': setSpeed(val); break;
+    case 'r': contDir = (val >= 0) ? 1 : -1; continuous = true; break;
+    case 'x': stopMotor(); break;
+    case 'z': stopMotor(); position = target = 0; break;
+    default:  Serial.println("Commandes : m <pas> | g <pos> | d <deg> | s <rpm> | r 1/-1 | x | z"); return;
+  }
+  Serial.printf("pos=%ld cible=%ld rpm=%.1f\n", position, target, rpm);
+}
+
+// ---------- Setup / Loop ----------
+void setup() {
+  for (uint8_t k = 0; k < 4; k++) {
+    pinMode(PINS[k], OUTPUT);
+    digitalWrite(PINS[k], LOW);
+  }
+  Serial.begin(115200);
+  Serial.setTimeout(20);
+  setSpeed(rpm);
+  setupWiFi();
+  setupWeb();
+}
+
+void loop() {
+  updateMotor();
+  server.handleClient();
+  handleSerial();
+}
